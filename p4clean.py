@@ -33,6 +33,7 @@ import re
 import fnmatch
 import ConfigParser
 import logging
+import shutil
 import platform
 
 __version__ = '0.3.2'
@@ -57,7 +58,7 @@ def shell_execute(command):
         result = subprocess.check_output(command.split(),
                                          stderr=subprocess.STDOUT)
     except subprocess.CalledProcessError, e:
-        logger.error("Error while calling command `%s`:%s " % (command, e))
+        logger.error("Error while calling command `%s`:%s ", command, e)
         raise ShellExecuteException
     return result
 
@@ -73,6 +74,8 @@ class Perforce(object):
             self.available = True
         except:
             self.available = False
+        self.depot_folders = set()
+        self.depot_files = set()
 
     @staticmethod
     def info():
@@ -111,30 +114,29 @@ class Perforce(object):
             return False
         return True
 
-    def get_untracked_files(self, root):
-        """ Return a list of untracked files at the 'root' path. """
+    def get_tracked_files(self, root):
+        """ Return tuple of tracked files and tracked folders at the 'root' path. """
+
+        root = os.path.normpath(root)
+
         fstat = self._get_perforce_fstat(root)
         if not fstat:
-            return []
-        depot_files = []
+            return 
+
         for line in fstat.splitlines():
             if line:
                 depot_file = os.path.normcase(os.path.normpath(line.lstrip("... clientFile").strip()))
-                depot_files.append(depot_file)
-        local_files = []
-        for path, directories, files in os.walk(root):
-            for file in files:
-                local_file = os.path.normcase(os.path.join(path, file))
-                local_files.append(local_file)
-            if platform.system() != 'Windows':
-                # os.walk() treats symlinks to directories as if they
-                # are directories, but we need to treat them as files.
-                for directory in directories:
-                    local_folder = os.path.normcase(os.path.join(path, directory))
-                    if os.path.islink(local_folder):
-                        local_files.append(local_folder)
-        untracked_files = set(local_files) - set(depot_files)
-        return list(untracked_files)
+                self.depot_files.add(depot_file)
+                folder = os.path.dirname(depot_file)
+                while folder not in self.depot_folders and folder != root:
+                    self.depot_folders.add(folder)
+                    folder = os.path.dirname(folder)
+
+    def is_untracked_folder(self, path):
+        return path not in self.depot_folders
+
+    def is_untracked_file(self, path):
+        return path not in self.depot_files
 
     def _get_perforce_fstat(self, root):
         """ Return Perforce status for all files under 'root' path. """
@@ -148,7 +150,7 @@ class Perforce(object):
                 return None
         except ShellExecuteException:
             logger.error("Perforce is unavailable:")
-            return None
+            raise
         # Add all opened files. This will make sure file opened for add don't
         # get cleaned
         try:
@@ -159,7 +161,7 @@ class Perforce(object):
                 return None
         except ShellExecuteException:
             logger.error("Perforce is unavailable:")
-            return None
+            raise
         return result
 
 
@@ -224,10 +226,10 @@ class P4CleanConfig(object):
                                         P4CleanConfig.EXCLUSION_OPTION)
             return exclusion_list.split(';')
         except ConfigParser.NoSectionError:
-            logger.error("Invalid p4clean config file: No section named \"%s\" found." % P4CleanConfig.SECTION_NAME)
+            logger.error("Invalid p4clean config file: No section named \"%s\" found.", P4CleanConfig.SECTION_NAME)
             return []
         except ConfigParser.NoOptionError:
-            logger.error("Invalid p4clean config file: No option named \"%s\" found." % P4CleanConfig.EXCLUSION_OPTION)
+            logger.error("Invalid p4clean config file: No option named \"%s\" found.", P4CleanConfig.EXCLUSION_OPTION)
             return []
 
 
@@ -237,6 +239,11 @@ class P4Clean:
         self.dry_run = False
         self.config = None
         self.perforce = Perforce()
+
+        self.deleted_folders_count = 0
+        self.deleted_files_count = 0
+        self.folder_error_msgs = []
+        self.file_error_msgs = []
 
     def run(self):
         """ Restore current working folder and subfolder to orginal state."""
@@ -264,85 +271,86 @@ class P4Clean:
         else:
             logger.setLevel(logging.INFO)
 
+        # Normalize the current working directory.  Usually a no-op,
+        # this is required to handle a corner case where the working
+        # directory's path contains a symlink, but the client spec's
+        # Root uses the "real" path.
+        os.chdir(os.path.realpath(os.getcwd()))
+
         if not self.perforce.is_inside_workspace():
-            logger.error(
-                "Nothing to clean: Current folder is not inside a Perforce workspace. Validate your perforce workspace with the command 'p4 where' or configure you command line workspace.")
+            logger.error("Nothing to clean: Current folder is not inside a Perforce workspace. Validate your perforce workspace with the command 'p4 where' or configure you command line workspace.")
             return
 
         self.config = P4CleanConfig(self.perforce.root, args.exclude)
 
-        (deleted_files_count, file_error_msgs) = self.delete_untracked_files()
+        self.perforce.get_tracked_files(os.getcwd())
 
-        (empty_folders_deleted_count, folder_error_msgs) = self.delete_empty_folders()
+        self.delete_untracked_files(os.getcwd())
 
         if self.dry_run:
             logger.info(80 * "-")
             logger.info("P4Clean dry run summary:")
             logger.info(80 * "-")
-            logger.info("%d untracked files would be deleted." % deleted_files_count)
-            logger.info("%d empty folders would be deleted." % empty_folders_deleted_count)
+            logger.info("%d untracked files would be deleted.", self.deleted_files_count)
+            logger.info("%d untracked folders would be deleted.", self.deleted_folders_count)
         else:
             logger.info(80 * "-")
             logger.info("P4Clean summary:")
             logger.info(80 * "-")
-            logger.info("%d untracked files deleted." % deleted_files_count)
-            logger.info("%d empty folders deleted." % empty_folders_deleted_count)
-            if file_error_msgs:
-                logger.error("%s files could not be deleted" % len(file_error_msgs))
-                logger.error("\n".join(file_error_msgs))
-            if folder_error_msgs:
-                logger.error("%s empty folders could not be deleted" % len(folder_error_msgs))
-                logger.error("\n".join(folder_error_msgs))
+            logger.info("%d untracked files deleted.", self.deleted_files_count)
+            logger.info("%d untracked folders deleted.", self.deleted_folders_count)
+            if self.file_error_msgs:
+                logger.error("%s files could not be deleted", len(self.file_error_msgs))
+                logger.error("\n".join(self.file_error_msgs))
+            if self.folder_error_msgs:
+                logger.error("%s untracked folders could not be deleted", len(self.folder_error_msgs))
+                logger.error("\n".join(self.folder_error_msgs))
 
-    def delete_empty_folders(self):
-        """Delete all empty folders under root (excluding root)"""
-        empty_deleted_count = 0
-        error_msgs = []
-        root = os.getcwd()
-        for path, directories, files in os.walk(root, topdown=False):
-            if not files and path is not root:
-                absolute_path = os.path.abspath(path)
-                if not self.config.is_excluded(absolute_path):
-                    if not os.listdir(absolute_path):
+    def delete_untracked_files(self, root):
+        names = os.listdir(root)
+        for name in names:
+            path = os.path.normpath(os.path.join(root, name))
+            if not self.config.is_excluded(path):
+                mode = os.lstat(path).st_mode
+                if (stat.S_ISDIR(mode)):
+                    if self.perforce.is_untracked_folder(path):
                         if self.dry_run:
-                            logger.info("Would delete folder: '%s' " % absolute_path)
-                            empty_deleted_count = empty_deleted_count + 1
+                            logger.info("Would delete folder: '%s'", path)
+                            self.deleted_folders_count = self.deleted_folders_count + 1
                             continue
                         try:
-                            os.rmdir(absolute_path)
-                            logger.info("Deleted folder: '%s' " % absolute_path)
-                            empty_deleted_count = empty_deleted_count + 1
-                        except:
-                            error_msgs.append("Cannot delete empty folder (%s)" % sys.exc_info()[1])
-        return empty_deleted_count, error_msgs
-
-    def delete_untracked_files(self):
-        deleted_count = 0
-        error_msgs = []
-        for filename in self.perforce.get_untracked_files(os.getcwd()):
-            if not self.config.is_excluded(filename):
-                if self.dry_run:
-                    logger.info("Would delete file: '%s' " % filename)
-                    deleted_count = deleted_count + 1
-                    continue
-                try:
-                    os.remove(filename)
-                except:
-                    if platform.system() == 'Windows':
-                        try:
-                            # Second try on Windows. Maybe the file was read
-                            # only?
-                            os.chmod(filename, stat.S_IWRITE)
-                            os.remove(filename)
-                        except:
-                            error_msgs.append("Cannot delete file (%s)" % sys.exc_info()[1])
+                            shutil.rmtree(path)
+                            logger.info("Deleted folder: '%s'", path)
+                            self.deleted_folders_count = self.deleted_folders_count + 1
+                        except Exception:
+                            self.folder_error_msgs.append("Cannot delete folder (%s)", sys.exc_info()[1])
                             continue
                     else:
-                        error_msgs.append("Cannot delete file (%s)" % sys.exc_info()[1])
-                logger.info("Deleted file: '%s'" % filename)
-                deleted_count = deleted_count + 1
-        return deleted_count, error_msgs
+                        self.delete_untracked_files(path)
+                else:
+                    if self.perforce.is_untracked_file(path):
+                        if self.dry_run:
+                            logger.info("Would delete file: '%s'", path)
+                            self.deleted_files_count = self.deleted_files_count + 1
+                            continue
+                        try:
+                            os.remove(path)
+                        except:
+                            if platform.system() == 'Windows':
+                                try:
+                                    # Second try on Windows.  Maybe the file was read only
+                                    # only?
+                                    os.chmod(path, stat.S_IWRITE)
+                                    os.remove(path)
+                                except:
+                                    self.file_error_msgs.append("Cannot delete file (%s)", sys.exc_info()[1])
+                                    continue
+                            else:
+                                self.file_error_msgs.append("Cannot delete file (%s)", sys.exc_info()[1])
+                                continue
 
+                        logger.info("Deleted file: '%s'", path)
+                        self.deleted_files_count = self.deleted_files_count + 1
 
 def main():
     P4Clean().run()
