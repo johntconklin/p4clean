@@ -35,6 +35,7 @@ import ConfigParser
 import logging
 import shutil
 import platform
+import scandir
 
 __version__ = '0.3.2'
 
@@ -307,12 +308,10 @@ class P4Clean:
                 logger.error("\n".join(self.folder_error_msgs))
 
     def delete_untracked_files(self, root):
-        names = os.listdir(root)
-        for name in names:
-            path = os.path.normpath(os.path.join(root, name))
+        for entry in scandir.scandir(root):
+            path = os.path.normpath(os.path.join(root, entry.name))
             if not self.config.is_excluded(path):
-                mode = os.lstat(path).st_mode
-                if (stat.S_ISDIR(mode)):
+                if entry.is_dir(follow_symlinks=False):
                     if self.perforce.is_untracked_folder(path):
                         if self.dry_run:
                             logger.info("Would delete folder: '%s'", path)
