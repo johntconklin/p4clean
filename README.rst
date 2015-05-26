@@ -27,7 +27,7 @@ From easy_install::
 
 Usage
 -----
-To clean current folder hiearchy ::
+To clean current folder hierarchy ::
 
     $ p4clean
 
